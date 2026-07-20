@@ -1,0 +1,25 @@
+# RadAssistant extension description file
+# Reference: https://slicer.readthedocs.io/en/latest/developer_guide/extensions.html
+# Replace the REPLACE-ME URLs with your real repository before submitting to the
+# Slicer Extensions Index. Not required for a local build / "Install from file".
+
+# Source-control type and location
+scm git
+scmurl https://github.com/REPLACE-ME/RadAssistant.git
+scmrevision main
+
+# Extensions this one depends on ("NA" if none)
+depends NA
+
+# Directory (relative to the checkout) that contains the top-level CMakeLists.txt
+build_subdirectory .
+
+# Metadata shown in the Extensions Manager
+homepage https://github.com/REPLACE-ME/RadAssistant
+contributors RadAssistant contributors
+category Utilities
+iconurl https://raw.githubusercontent.com/REPLACE-ME/RadAssistant/main/RadAssistant.png
+description Natural-language agentic assistant for 3D Slicer. Bring your own model (local via Ollama / OpenAI-compatible, or Anthropic cloud). It drives Slicer's validated tools and shows its work. Research/visualization aid, not a diagnostic device.
+screenshoturls
+
+enabled 1
