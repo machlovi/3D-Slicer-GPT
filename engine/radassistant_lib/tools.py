@@ -672,10 +672,16 @@ class ToolRegistry:
              "input_schema": {"type": "object", "properties": {}}},
 
             {"name": "read_skill",
-             "description": "Load the full instructions of a named workflow skill (the available skills are listed in your system prompt). Do this before executing a workflow a skill covers.",
+             "description": "Load the full instructions of a named workflow skill (call list_skills to see the available skills). Do this before executing a workflow a skill covers.",
              "input_schema": {"type": "object", "properties": {
                  "name": {"type": "string"}},
               "required": ["name"]}},
+
+            {"name": "list_skills",
+             "description": ("List every workflow skill available (name + one-line description). "
+                             "Call this when the user asks what you can do or which skills you have, so "
+                             "you report the REAL list — never invent skills or inflate the count."),
+             "input_schema": {"type": "object", "properties": {}}},
 
             {"name": "execute_python",
              "description": "Run Python code inside Slicer (slicer, vtk, qt, numpy available). THE USER MUST APPROVE each execution via a dialog. Use only for a genuinely novel read-only query when no dedicated tool exists. Do NOT use it to work around a missing capability or to edit segments/volumes by guessing at the API — if a segmentation/editing task has no dedicated tool, tell the user plainly instead. Set a variable named `result` for a value you want returned.",
@@ -1974,6 +1980,9 @@ class ToolRegistry:
 
     def _tool_read_skill(self, name):
         return _ok(self._skills.read(name))
+
+    def _tool_list_skills(self):
+        return _ok(self._skills.list_for_prompt())
 
     def _tool_execute_python(self, code, reason=""):
         # Hard per-turn cap: catches the fail → other-tool → fail interleave that

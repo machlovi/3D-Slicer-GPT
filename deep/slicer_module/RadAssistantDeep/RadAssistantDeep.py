@@ -137,8 +137,14 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
         self._worker = None
         self._stop = threading.Event()
         self._decision_q = queue.Queue()
-        self._cur_kind = None
-        self._cur_id = None
+        self._history = []
+        self._streaming_text = ""
+        self._thinking_text = ""
+        self._render_pending = False
+        self._render_timer = qt.QTimer()
+        self._render_timer.setInterval(120)   # batch repaints ~8/s (native panel's cadence)
+        self._render_timer.connect("timeout()", self._render_if_needed)
+        self._render_timer.start()
 
         # --- Setup section ----------------------------------------------------
         setupBox = ctk.ctkCollapsibleButton()
@@ -228,89 +234,57 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
         )
 
     # -- transcript helpers (reused from the proven panel) ---------------------
-    def _append(self, html_text):
-        self.transcript.append(html_text)
-        sb = self.transcript.verticalScrollBar()
-        sb.setValue(sb.maximum)
+    # -- transcript: buffer + 120ms timer + setMarkdown (native panel's approach) --
+    # Streamed deltas accumulate in buffers; a 120ms QTimer repaints the whole
+    # transcript ONCE as markdown. This replaces per-token insertText, which
+    # relaid-out the QTextBrowser on every token (O(n^2) and plain-text only).
+    def _append(self, markdown):
+        self._history.append(markdown)
+        self._render_pending = True
 
     def _appendSystem(self, text):
-        self._append("<div style='color:#888'><i>%s</i></div>" % _esc(text).replace("\n", "<br>"))
+        self._append("*%s*" % text.replace("\n", " "))
 
     def _appendUser(self, text):
-        self._append("<div style='color:#1a5fb4'><b>You:</b> %s</div>" % _esc(text))
-
-    # def _stream_delta(self, kind, mid, text):
-    #     """Append a streamed thinking/answer delta. Uses insertText (NOT insertHtml)
-    #     so token whitespace is preserved (HTML collapse mangles ' and' -> 'and')."""
-    #     if self._cur_kind != kind or self._cur_id != mid:
-    #         self._finalize_stream()
-    #         colour = qt.QColor("#888") if kind == "thinking" else qt.QColor("#1c1c1c")
-    #         cursor = self.transcript.textCursor()
-    #         cursor.movePosition(qt.QTextCursor.End)
-    #         cursor.insertBlock()
-    #         hdr = qt.QTextCharFormat()
-    #         hdr.setForeground(colour)
-    #         hdr.setFontWeight(qt.QFont.Bold)
-    #         cursor.insertText("RadAssistant (thinking): " if kind == "thinking" else "RadAssistant: ", hdr)
-    #         fmt = qt.QTextCharFormat()
-    #         fmt.setForeground(colour)
-    #         fmt.setFontItalic(kind == "thinking")
-    #         self._cur_fmt = fmt
-    #         self._cur_kind = kind
-    #         self._cur_id = mid
-    #     cursor = self.transcript.textCursor()
-    #     cursor.movePosition(qt.QTextCursor.End)
-    #     cursor.insertText(text, self._cur_fmt)
-    #     self.transcript.setTextCursor(cursor)
-    #     sb = self.transcript.verticalScrollBar()
-    #     sb.setValue(sb.maximum)
-
-    def _stream_delta(self, kind, mid, text):
-        """Stream plain text live (whitespace-safe)."""
-        if self._cur_kind != kind or self._cur_id != mid:
-            self._finalize_stream()   # finalize the PREVIOUS message as markdown
-            # start a new streaming block
-            # self._stream_buffer = ""          # ← NEW: accumulate the raw text
-            self._stream_block_start = None
-            colour = qt.QColor("#888") if kind == "thinking" else qt.QColor("#1c1c1c")
-            cursor = self.transcript.textCursor()
-            cursor.movePosition(qt.QTextCursor.End)
-            cursor.insertBlock()
-            # remember where this message starts so we can replace it on finalize
-            self._stream_block_position = cursor.position()
-            hdr = qt.QTextCharFormat()
-            hdr.setForeground(colour)
-            hdr.setFontWeight(qt.QFont.Bold)
-            cursor.insertText("RadAssistant (thinking): " if kind == "thinking" else "RadAssistant: ", hdr)
-            fmt = qt.QTextCharFormat()
-            fmt.setForeground(colour)
-            fmt.setFontItalic(kind == "thinking")
-            self._cur_fmt = fmt
-            self._cur_kind = kind
-            self._cur_id = mid
-
-        # Stream plain text live (whitespace-safe)
-        # self._stream_buffer = getattr(self, "_stream_buffer", "") + text
-        cursor = self.transcript.textCursor()
-        cursor.movePosition(qt.QTextCursor.End)
-        cursor.insertText(text, self._cur_fmt)
-        self.transcript.setTextCursor(cursor)
-        sb = self.transcript.verticalScrollBar()
-        sb.setValue(sb.maximum)
-
-    def _finalize_stream(self):
-        self._cur_kind = None
-        self._cur_id = None
+        self._append("**You:** " + text)
 
     def _appendTool(self, name, text, is_error):
-        colour = "#c01c28" if is_error else "#26a269"
         first = (text or "").strip().splitlines()
-        head = first[0] if first else ""
-        if len(head) > 200:
-            head = head[:200] + "..."
-        mark = "[x]" if is_error else "[ok]"
-        self._append("<div style='color:%s;margin-left:8px'>%s <code>%s</code> - %s</div>"
-                     % (colour, mark, _esc(name), _esc(head)))
+        head = (first[0] if first else "")[:200]
+        mark = "⚠" if is_error else "✓"
+        self._append("`%s %s` — %s" % (mark, name, head))
+
+    def _stream_delta(self, kind, mid, text):
+        if kind == "thinking":
+            self._thinking_text += text
+            if self.thinkingCheck.checked:
+                self._render_pending = True
+        else:
+            self._streaming_text += text
+            self._render_pending = True
+
+    def _finalize_stream(self):
+        self._flush_streaming()
+
+    def _flush_streaming(self):
+        if self._streaming_text.strip():
+            self._history.append("**RadAssistant:** " + self._streaming_text.strip())
+        self._streaming_text = ""
+        self._thinking_text = ""
+        self._render_pending = True
+
+    def _render_if_needed(self):
+        if not self._render_pending:
+            return
+        self._render_pending = False
+        parts = list(self._history)
+        if self.thinkingCheck.checked and self._thinking_text.strip():
+            parts.append("> 💭 *" + self._thinking_text.strip().replace("\n", " ") + "*")
+        if self._streaming_text.strip():
+            parts.append("**RadAssistant:** " + self._streaming_text.strip())
+        self.transcript.setMarkdown("\n\n".join(parts))
+        sb = self.transcript.verticalScrollBar()
+        sb.setValue(sb.maximum)
 
     # -- connect ---------------------------------------------------------------
     def _saveSettings(self):
@@ -500,22 +474,20 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
             return
         self._finalize_stream()
 
-        if etype == "tool_call":                              # ← NEW
+        if etype == "tool_call":
             name = event.get("name", "tool")
             args = event.get("args", {})
             arg_hint = ", ".join(f"{k}={v}" for k, v in list(args.items())[:2])
-            self._append("<div style='color:#9141ac;margin-left:8px'>"
-                        "🔧 <i>Calling</i> <code>%s</code>(%s)…</div>"
-                        % (_esc(name), _esc(arg_hint)))
+            self._append("🔧 *Calling* `%s`(%s)…" % (name, arg_hint))
         if etype == "tool":
             self._appendTool(event.get("name", "tool"), event.get("text", ""), event.get("error", False))
         elif etype == "todos":
-            lines = []
+            lines = ["**Plan:**"]
             for t in event.get("todos", []):
                 st = t.get("status")
-                mark = ">" if st == "in_progress" else "x" if st == "completed" else "-"
-                lines.append("%s %s" % (mark, t.get("content", "")))
-            self._appendSystem("Plan:\n" + "\n".join(lines))
+                mark = "☑" if st == "completed" else "▶" if st == "in_progress" else "☐"
+                lines.append("- %s %s" % (mark, t.get("content", "")))
+            self._append("\n".join(lines))
         elif etype == "approval":
             self._handleApproval(event.get("actions", []))
         elif etype == "stopped":
@@ -586,4 +558,6 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
         self._appendSystem("Disconnected.")
 
     def cleanup(self):
+        if getattr(self, "_render_timer", None) is not None:
+            self._render_timer.stop()
         self.onDisconnect()
