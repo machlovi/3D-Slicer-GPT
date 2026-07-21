@@ -239,15 +239,45 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
     def _appendUser(self, text):
         self._append("<div style='color:#1a5fb4'><b>You:</b> %s</div>" % _esc(text))
 
+    # def _stream_delta(self, kind, mid, text):
+    #     """Append a streamed thinking/answer delta. Uses insertText (NOT insertHtml)
+    #     so token whitespace is preserved (HTML collapse mangles ' and' -> 'and')."""
+    #     if self._cur_kind != kind or self._cur_id != mid:
+    #         self._finalize_stream()
+    #         colour = qt.QColor("#888") if kind == "thinking" else qt.QColor("#1c1c1c")
+    #         cursor = self.transcript.textCursor()
+    #         cursor.movePosition(qt.QTextCursor.End)
+    #         cursor.insertBlock()
+    #         hdr = qt.QTextCharFormat()
+    #         hdr.setForeground(colour)
+    #         hdr.setFontWeight(qt.QFont.Bold)
+    #         cursor.insertText("RadAssistant (thinking): " if kind == "thinking" else "RadAssistant: ", hdr)
+    #         fmt = qt.QTextCharFormat()
+    #         fmt.setForeground(colour)
+    #         fmt.setFontItalic(kind == "thinking")
+    #         self._cur_fmt = fmt
+    #         self._cur_kind = kind
+    #         self._cur_id = mid
+    #     cursor = self.transcript.textCursor()
+    #     cursor.movePosition(qt.QTextCursor.End)
+    #     cursor.insertText(text, self._cur_fmt)
+    #     self.transcript.setTextCursor(cursor)
+    #     sb = self.transcript.verticalScrollBar()
+    #     sb.setValue(sb.maximum)
+
     def _stream_delta(self, kind, mid, text):
-        """Append a streamed thinking/answer delta. Uses insertText (NOT insertHtml)
-        so token whitespace is preserved (HTML collapse mangles ' and' -> 'and')."""
+        """Stream plain text live (whitespace-safe)."""
         if self._cur_kind != kind or self._cur_id != mid:
-            self._finalize_stream()
+            self._finalize_stream()   # finalize the PREVIOUS message as markdown
+            # start a new streaming block
+            # self._stream_buffer = ""          # ← NEW: accumulate the raw text
+            self._stream_block_start = None
             colour = qt.QColor("#888") if kind == "thinking" else qt.QColor("#1c1c1c")
             cursor = self.transcript.textCursor()
             cursor.movePosition(qt.QTextCursor.End)
             cursor.insertBlock()
+            # remember where this message starts so we can replace it on finalize
+            self._stream_block_position = cursor.position()
             hdr = qt.QTextCharFormat()
             hdr.setForeground(colour)
             hdr.setFontWeight(qt.QFont.Bold)
@@ -258,6 +288,9 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
             self._cur_fmt = fmt
             self._cur_kind = kind
             self._cur_id = mid
+
+        # Stream plain text live (whitespace-safe)
+        # self._stream_buffer = getattr(self, "_stream_buffer", "") + text
         cursor = self.transcript.textCursor()
         cursor.movePosition(qt.QTextCursor.End)
         cursor.insertText(text, self._cur_fmt)
@@ -466,6 +499,14 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
             self._stream_delta("assistant", event.get("id", "cur"), event.get("text", ""))
             return
         self._finalize_stream()
+
+        if etype == "tool_call":                              # ← NEW
+            name = event.get("name", "tool")
+            args = event.get("args", {})
+            arg_hint = ", ".join(f"{k}={v}" for k, v in list(args.items())[:2])
+            self._append("<div style='color:#9141ac;margin-left:8px'>"
+                        "🔧 <i>Calling</i> <code>%s</code>(%s)…</div>"
+                        % (_esc(name), _esc(arg_hint)))
         if etype == "tool":
             self._appendTool(event.get("name", "tool"), event.get("text", ""), event.get("error", False))
         elif etype == "todos":

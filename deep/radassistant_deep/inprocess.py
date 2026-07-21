@@ -277,39 +277,37 @@ def _current_todos(built, run_config):
         return None
 
 
-def _reconcile_final(built, run_config, streamed, emit, todos_before=None):
-    from langchain_core.messages import AIMessage
-    values = built.agent.get_state(run_config).values
-    todos = values.get("todos")
-    # Only surface a plan the model actually wrote/updated THIS turn. The thread is
-    # resumed across restarts, so a plan left over from an earlier turn (e.g. an old
-    # TotalSegmentator plan) would otherwise redisplay on every unrelated request
-    # like a plain "load a CT" — misaligned with what the turn actually did.
-    if todos and todos != todos_before:
-        emit({"type": "todos", "todos": todos})
-    for msg in reversed(values.get("messages", [])):
-        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
-            full = msg.content if isinstance(msg.content, str) else ""
-            mid = getattr(msg, "id", None) or "cur"
-            already = streamed.get(mid, "")
-            if full and full != already and full.startswith(already):
-                emit({"type": "assistant_delta", "id": mid, "text": full[len(already):]})
-            break
+# def _reconcile_final(built, run_config, streamed, emit, todos_before=None):
+#     from langchain_core.messages import AIMessage
+#     try: 
+#     values = built.agent.get_state(run_config).values
+#     todos = values.get("todos")
+#     # Only surface a plan the model actually wrote/updated THIS turn. The thread is
+#     # resumed across restarts, so a plan left over from an earlier turn (e.g. an old
+#     # TotalSegmentator plan) would otherwise redisplay on every unrelated request
+#     # like a plain "load a CT" — misaligned with what the turn actually did.
+#     if todos and todos != todos_before:
+#         emit({"type": "todos", "todos": todos})
+#     for msg in reversed(values.get("messages", [])):
+#         if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+#             full = msg.content if isinstance(msg.content, str) else ""
+#             mid = getattr(msg, "id", None) or "cur"
+#             already = streamed.get(mid, "")
+#             if full and full != already and full.startswith(already):
+#                 emit({"type": "assistant_delta", "id": mid, "text": full[len(already):]})
+#             break
 
-
-def run_turn(built, text, run_config, emit, ask, should_stop=None):
-    """Run one user turn in-process. ``emit(event_dict)`` streams UI events;
-    ``ask(actions) -> decisions`` handles approvals (returns None to reject/cancel);
-    ``should_stop()`` lets a Stop button interrupt mid-turn."""
+def run_turn(built, text, run_config, emit, ask, should_stop=None, interrupts_possible=False):
     from langgraph.types import Command
     streamed = {}
-    todos_before = _current_todos(built, run_config)   # snapshot to detect a fresh plan
     try:
         stream = built.agent.stream(
             {"messages": [{"role": "user", "content": text}]},
             config=run_config, stream_mode="messages")
         stopped = _consume_stream(stream, emit, streamed, should_stop)
-        while not stopped:
+        # Only probe for interrupts if this mode can actually interrupt —
+        # otherwise skip the expensive get_state() [1][13].
+        while not stopped and interrupts_possible:
             request = _pending_interrupt(built, run_config)
             if request is None:
                 break
@@ -323,8 +321,43 @@ def run_turn(built, text, run_config, emit, ask, should_stop=None):
             stopped = _consume_stream(stream, emit, streamed, should_stop)
         if stopped:
             emit({"type": "stopped"})
-        else:
-            _reconcile_final(built, run_config, streamed, emit, todos_before)
-    except Exception as exc:  # never let a turn kill the worker thread silently
+    except Exception as exc:
         emit({"type": "error", "text": "Turn failed: %s" % exc})
     emit({"type": "turn_done"})
+    
+
+
+
+
+# def run_turn(built, text, run_config, emit, ask, should_stop=None):
+#     from langgraph.types import Command
+#     streamed = {}
+#     todos_before = _current_todos(built, run_config)
+#     try:
+#         stream = built.agent.stream(
+#             {"messages": [{"role": "user", "content": text}]},
+#             config=run_config, stream_mode="messages")
+#         stopped = _consume_stream(stream, emit, streamed, should_stop)
+#         while not stopped:
+#             request = _pending_interrupt(built, run_config)
+#             if request is None:
+#                 break
+#             actions = (request or {}).get("action_requests", [])
+#             decisions = ask([...])
+#             if decisions is None:
+#                 decisions = [{"type": "reject", "message": "Cancelled."} for _ in actions]
+#             stream = built.agent.stream(Command(resume={"decisions": decisions}),
+#                                         config=run_config, stream_mode="messages")
+#             stopped = _consume_stream(stream, emit, streamed, should_stop)
+
+#         # ── KEY FIX: re-enable input NOW, before the slow reconciliation ──
+#         emit({"type": "turn_done"})   # ← input responsive immediately
+
+#         if stopped:
+#             emit({"type": "stopped"})
+#         # else:
+#         #     _reconcile_final(built, run_config, streamed, emit, todos_before)
+#         return   # ← don't emit turn_done again at the bottom
+#     except Exception as exc:
+#         emit({"type": "error", "text": "Turn failed: %s" % exc})
+#     emit({"type": "turn_done"})
