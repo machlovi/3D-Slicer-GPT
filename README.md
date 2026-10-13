@@ -9,6 +9,42 @@ model (Ollama / llama.cpp / vLLM), any OpenAI-compatible server, or the Anthropi
 
 > Research and visualization aid. **Not a diagnostic device.** Don't put PHI in the chat.
 
+## The problem
+
+3D Slicer is one of the most capable open platforms for medical image analysis —
+and one of the hardest to actually use. Doing something as simple as "segment the
+lungs and tell me their volume" means knowing that the answer is *Segment Editor →
+Threshold effect → −1000/−400 HU → Islands effect → Segment Statistics module*,
+spread across menus and modules that assume you already know the workflow. Add
+AI segmentation (TotalSegmentator, MONAI, nnU-Net), radiomics (PyRadiomics),
+registration, DICOM export, and RT dosimetry, and the surface area runs to
+hundreds of modules and thousands of parameters. The expertise to use Slicer well
+is orthogonal to the expertise to read the images — a radiologist or researcher
+loses time to the tool instead of the task.
+
+The obvious fix — "put an LLM in front of it" — creates three new problems of its
+own, visible in any naive LLM-in-Slicer plugin:
+
+- **The model is blind and unaccountable.** It fires tool calls and hopes, with no
+  way to check its own output against the scene, so mistakes (wrong HU window,
+  wrong segment, botched registration) go unnoticed, which matters more in a
+  radiology context than in a general coding assistant.
+- **It freezes the application.** Long-running operations (AI segmentation,
+  registration) called naively on Slicer's Qt main thread block the entire UI —
+  TotalSegmentator alone can hang Slicer for minutes on CPU hardware.
+- **It has no memory and no restraint.** Every session starts cold, and nothing
+  stops the model from reinventing clinical logic in ad hoc Python or deleting
+  scene data without asking.
+
+RadAssistant exists to close this gap without introducing new risk: it orchestrates
+Slicer's **existing validated tools** instead of reimplementing clinical logic,
+**verifies its own work** against screenshots or structured scene-state, runs
+heavy operations **off the UI thread**, keeps **persistent memory** across
+restarts, and enforces a code-level **approval/PHI/safety policy** — not just a
+prompt asking nicely — before anything irreversible or identifiable happens. See
+[CAPABILITY_REPORT.md](CAPABILITY_REPORT.md) for a candid, code-grounded read on
+how much of that is actually true today versus still in progress.
+
 ## Layout
 
 | Path | What |
