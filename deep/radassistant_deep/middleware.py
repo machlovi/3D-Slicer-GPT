@@ -176,3 +176,26 @@ class DiagnosisGuardMiddleware(AgentMiddleware):
             return None
         patched = AIMessage(content=enforced, id=last.id)  # same id -> in-place replace
         return {"messages": [patched]}
+
+
+class OpenAIProxySanitizerMiddleware(AgentMiddleware):
+    """Sanitizes model requests for OpenAI-compatible proxies (e.g. NYU GPT / LiteLLM / vLLM).
+
+    Converts list-based `system_message.content` (Anthropic block format with prompt caching)
+    into a plain text string so OpenAI-compatible proxy gateways do not reject the request.
+    """
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        system_message = getattr(request, "system_message", None)
+        if system_message is not None and isinstance(system_message.content, list):
+            text_blocks = []
+            for b in system_message.content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    text_blocks.append(b.get("text", ""))
+                elif isinstance(b, str):
+                    text_blocks.append(b)
+            clean_text = "\n\n".join(text_blocks)
+            from langchain_core.messages import SystemMessage
+            clean_sys = SystemMessage(content=clean_text)
+            request = request.override(system_message=clean_sys)
+        return handler(request)

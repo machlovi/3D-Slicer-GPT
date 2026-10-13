@@ -225,16 +225,32 @@ class RadAssistantLogic(ScriptedLoadableModuleLogic):
     def set(self, key, value):
         self.s().setValue("RadAssistant/" + key, value)
 
-    def api_key(self):
-        return os.environ.get("ANTHROPIC_API_KEY") or self.get("apiKey", "")
+    def api_key(self, provider=""):
+        p = (provider or self.get("provider", "ollama")).lower()
+        key_in_settings = self.get("apiKey", "").strip()
+        if key_in_settings:
+            return key_in_settings
+        if p in ("openai_cloud", "openai_official", "openai"):
+            return os.environ.get("OPENAI_API_KEY") or os.environ.get("UV_API_KEY", "")
+        if p == "anthropic":
+            return os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("UV_API_KEY", "")
+        if p == "gemini":
+            return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("UV_API_KEY", "")
+        return (os.environ.get("OPENAI_API_KEY") or
+                os.environ.get("UV_API_KEY") or
+                os.environ.get("ANTHROPIC_API_KEY") or
+                os.environ.get("GEMINI_API_KEY") or
+                os.environ.get("GOOGLE_API_KEY", ""))
 
     def backend_config(self):
+        provider = self.get("provider", "ollama")
+        default_url = "https://api.openai.com/v1" if provider == "openai_cloud" else "http://localhost:8000/v1"
         return {
-            "provider": self.get("provider", "ollama"),
+            "provider": provider,
             "model": self.get("model", "qwen2.5:14b"),
             "host": self.get("serverUrl", "http://localhost:11434"),
-            "base_url": self.get("serverUrl", "http://localhost:8000/v1"),
-            "api_key": self.api_key(),
+            "base_url": self.get("serverUrl", default_url),
+            "api_key": self.api_key(provider),
             "effort": self.get("effort", "high"),
             "vision": self.get("vision", "false") == "true",
             "num_ctx": int(self.get("numCtx", 16384)),
@@ -294,6 +310,7 @@ class RadAssistantWidget(ScriptedLoadableModuleWidget):
 
         self.providerCombo = qt.QComboBox()
         self.providerCombo.addItem("Ollama (local / HPC)", "ollama")
+        self.providerCombo.addItem("OpenAI Cloud (gpt-4o, etc.)", "openai_cloud")
         self.providerCombo.addItem("Gemini (free — Google cloud)", "gemini")
         self.providerCombo.addItem("OpenAI-compatible (vLLM / TGI / LM Studio)", "openai")
         self.providerCombo.addItem("Anthropic (cloud)", "anthropic")
@@ -310,14 +327,14 @@ class RadAssistantWidget(ScriptedLoadableModuleWidget):
         form.addRow("Server URL:", self.serverEdit)
 
         self.modelEdit = qt.QLineEdit(self.logic.get("model", "qwen2.5:14b"))
-        self.modelEdit.setPlaceholderText("e.g. llama3.3, qwen2.5:32b, gpt-oss:120b")
+        self.modelEdit.setPlaceholderText("e.g. llama3.3, qwen2.5:32b, gpt-4o, claude-3-7-sonnet")
         self.modelEdit.connect("editingFinished()", self._save_and_rebuild)
         form.addRow("Model:", self.modelEdit)
 
         self.apiKeyEdit = qt.QLineEdit()
         self.apiKeyEdit.setEchoMode(qt.QLineEdit.Password)
         self.apiKeyEdit.setText(self.logic.get("apiKey", ""))
-        self.apiKeyEdit.setPlaceholderText("sk-ant-…  (or an authenticated server's key)")
+        self.apiKeyEdit.setPlaceholderText("sk-… or env var fallback")
         self.apiKeyEdit.connect("editingFinished()", self._save_and_rebuild)
         form.addRow("API key:", self.apiKeyEdit)
 
@@ -352,44 +369,59 @@ class RadAssistantWidget(ScriptedLoadableModuleWidget):
     def _on_provider_changed(self, _text=None):
         provider = self.providerCombo.currentData
         is_ollama = provider == "ollama"
-        is_openai = provider == "openai"
+        is_openai_local = provider == "openai"
+        is_openai_cloud = provider == "openai_cloud"
         is_anthropic = provider == "anthropic"
         is_gemini = provider == "gemini"
 
-        self.serverEdit.setEnabled(is_ollama or is_openai)
-        self.apiKeyEdit.setEnabled(is_anthropic or is_openai or is_gemini)
+        self.serverEdit.setEnabled(is_ollama or is_openai_local or is_openai_cloud)
+        self.apiKeyEdit.setEnabled(is_anthropic or is_openai_local or is_openai_cloud or is_gemini)
         self.effortCombo.setEnabled(is_anthropic)
-        self.visionCheck.setEnabled(is_ollama or is_openai or is_gemini)
+        self.visionCheck.setEnabled(is_ollama or is_openai_local or is_openai_cloud or is_gemini)
+
+        # Update API key placeholder based on provider
+        if is_openai_cloud:
+            self.apiKeyEdit.setPlaceholderText("sk-proj-… (or set OPENAI_API_KEY env var)")
+        elif is_anthropic:
+            self.apiKeyEdit.setPlaceholderText("sk-ant-… (or set ANTHROPIC_API_KEY env var)")
+        elif is_gemini:
+            self.apiKeyEdit.setPlaceholderText("AIzaSy… (or set GEMINI_API_KEY env var)")
+        else:
+            self.apiKeyEdit.setPlaceholderText("optional for local servers")
 
         # sensible default server URL when the field is empty or clearly wrong
-        if is_ollama and (":8000" in self.serverEdit.text or not self.serverEdit.text):
+        if is_ollama and (":8000" in self.serverEdit.text or "api.openai.com" in self.serverEdit.text or not self.serverEdit.text):
             self.serverEdit.setText("http://localhost:11434")
-        if is_openai and (":11434" in self.serverEdit.text or not self.serverEdit.text):
+        elif is_openai_local and (":11434" in self.serverEdit.text or "api.openai.com" in self.serverEdit.text or not self.serverEdit.text):
             self.serverEdit.setText("http://localhost:8000/v1")
+        elif is_openai_cloud and (":11434" in self.serverEdit.text or ":8000" in self.serverEdit.text or not self.serverEdit.text):
+            self.serverEdit.setText("https://api.openai.com/v1")
 
         # sensible default model when switching providers
         model = self.modelEdit.text.strip()
-        if is_ollama and (not model or model.startswith(("gemini", "claude"))):
+        if is_ollama and (not model or model.startswith(("gemini", "claude", "gpt-4"))):
             self.modelEdit.setText("qwen2.5:14b")
+        elif is_openai_cloud and (not model or not model.startswith("gpt-")):
+            self.modelEdit.setText("gpt-4o")
         elif is_gemini and not model.startswith("gemini"):
             self.modelEdit.setText("gemini-2.0-flash")
         elif is_anthropic and not model.startswith("claude"):
-            self.modelEdit.setText("claude-opus-4-8")
+            self.modelEdit.setText("claude-3-7-sonnet-20250219")
 
         notes = {
             "ollama": "Point Server URL at your Ollama host. On the HPC set OLLAMA_HOST=0.0.0.0 "
                       "and use http://&lt;hpc-address&gt;:11434. Use a tool-capable model "
                       "(qwen2.5, llama3.1/3.3, mistral-nemo, gpt-oss). No API key, no cloud, "
                       "data stays on your machine.",
-            "openai": "For vLLM / TGI / LM Studio. Server URL should end in /v1. API key only if "
-                      "the server requires one.",
-            "anthropic": "Best vision + reasoning for the demo. Needs the 'anthropic' package "
-                         "(Install button) and a key. Screenshots are sent to the cloud — "
-                         "anonymized data only.",
-            "gemini": "Free Google Gemini via its OpenAI-compatible API — no local server, no pip "
-                      "install. Paste your Gemini API key; a good free model is gemini-2.0-flash "
-                      "(or gemini-2.5-flash). Multimodal, so vision can be turned on. Free-tier "
-                      "rate limits apply; prompts/images go to Google — use sample/anonymized data.",
+            "openai_cloud": "Official OpenAI Cloud (gpt-4o, gpt-4o-mini, o3-mini). Enter your "
+                            "OpenAI API key (sk-...) or export OPENAI_API_KEY before starting Slicer. "
+                            "Multimodal, so vision can be enabled.",
+            "openai": "For local vLLM / TGI / LM Studio. Server URL should end in /v1. API key only if "
+                      "the server requires authentication.",
+            "anthropic": "Best vision + reasoning. Needs the 'anthropic' package "
+                         "(Install button) and a key (sk-ant-...) or ANTHROPIC_API_KEY env var.",
+            "gemini": "Google Gemini via its OpenAI-compatible API. Enter your Gemini API key "
+                      "(or GEMINI_API_KEY / GOOGLE_API_KEY env var); a good model is gemini-2.0-flash.",
         }
         self.setupNote.setText("<small>" + notes[provider] + "</small>")
         self._save_and_rebuild()
@@ -522,6 +554,14 @@ class RadAssistantWidget(ScriptedLoadableModuleWidget):
         if config["provider"] == "anthropic" and not config["api_key"]:
             slicer.util.errorDisplay("Set your Anthropic API key in Setup (or export "
                                      "ANTHROPIC_API_KEY before launching Slicer).")
+            return False
+        if config["provider"] in ("openai_cloud", "openai_official") and not config["api_key"]:
+            slicer.util.errorDisplay("Set your OpenAI API key in Setup (or export "
+                                     "OPENAI_API_KEY before launching Slicer).")
+            return False
+        if config["provider"] == "gemini" and not config["api_key"]:
+            slicer.util.errorDisplay("Set your Gemini API key in Setup (or export "
+                                     "GEMINI_API_KEY / GOOGLE_API_KEY before launching Slicer).")
             return False
         try:
             from radassistant_lib.backends import build_backend

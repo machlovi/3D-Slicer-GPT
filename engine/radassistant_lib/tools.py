@@ -185,6 +185,23 @@ def _find_segment_id(segmentation_node, segment_name):
     return None, f"no segment matching '{segment_name}'. Segments: {shown}"
 
 
+def _scalar_to_labelmap(scalar_node, name=None):
+    """Reinterpret a scalar volume's voxels as integer labels in a new labelmap node
+    (deep-copied so the two nodes don't share image data). Used when a mask was loaded
+    as a plain scalar volume and the user wants it as a segmentation."""
+    lm = slicer.mrmlScene.AddNewNodeByClass(
+        "vtkMRMLLabelMapVolumeNode",
+        slicer.mrmlScene.GenerateUniqueName(name or (scalar_node.GetName() + "_label")))
+    if scalar_node.GetImageData() is not None:
+        img = vtk.vtkImageData()
+        img.DeepCopy(scalar_node.GetImageData())
+        lm.SetAndObserveImageData(img)
+    ijk_to_ras = vtk.vtkMatrix4x4()
+    scalar_node.GetIJKToRASMatrix(ijk_to_ras)
+    lm.SetIJKToRASMatrix(ijk_to_ras)
+    return lm
+
+
 def _confirm(title, body, code=None):
     """Modal approval dialog. Returns True if the human approves."""
     dialog = qt.QDialog(slicer.util.mainWindow())
@@ -218,6 +235,10 @@ class ToolRegistry:
         self._exec_fails_total = 0     # TOTAL execute_python errors this turn → hard cap
         self._external = {}            # name -> LoadedTool from connectors (v2, opt-in)
         self.approval_mode = "manual"  # manual | accept | auto — set by the UI buttons
+        self._recorder_active = False
+        self._recorded_trajectory = []
+        self._recorder_observers = []
+        self._recorder_output_filename = "slicer_cleanup_log.json"
 
     def begin_turn(self):
         """Reset per-turn safety counters. Called by the widget on each new user
@@ -295,6 +316,19 @@ class ToolRegistry:
              "input_schema": {"type": "object", "properties": {
                  "path": {"type": "string", "description": "Absolute file path"}},
               "required": ["path"]}},
+
+            {"name": "load_segmentation",
+             "description": ("Load a SEGMENTATION / mask so the user can SEE it as colored structures and "
+                             "measure/toggle/3D-render them. Use this (not load_file) for a label-map or mask "
+                             "file (a NIfTI/NRRD of integer labels, or a .seg.nrrd), or to turn an already-"
+                             "loaded label volume into a proper segmentation. It imports the labels into a "
+                             "segmentation node, makes it visible on the slice views, and readies it for "
+                             "list_segments / measure_segment_volumes / show_segmentation_3d. Pass "
+                             "reference_volume to overlay it correctly on a specific image."),
+             "input_schema": {"type": "object", "properties": {
+                 "path": {"type": "string", "description": "mask/label file to load (NIfTI/NRRD, or .seg.nrrd)"},
+                 "labelmap_name": {"type": "string", "description": "instead of a path, the name of a label/scalar volume already in the scene to convert"},
+                 "reference_volume": {"type": "string", "description": "the image this mask belongs to, so geometry lines up (omit if only one volume is loaded)"}}}},
 
             {"name": "import_dicom_folder",
              "description": "Import a folder of DICOM files into Slicer's DICOM database and load the images into the scene.",
@@ -640,6 +674,20 @@ class ToolRegistry:
                  "roi_subset": {"type": "array", "items": {"type": "string"},
                                 "description": "Only segment these structures (e.g. ['liver','spleen','kidney_left','kidney_right']) — much faster/less memory. Only valid with task 'total'/'total_mr'."}}}},
 
+            {"name": "run_musclemap",
+             "description": ("Run MuscleMap (SlicerMuscleMap) whole-body muscle + bone AI segmentation on the "
+                             "loaded image — the specialist tool for musculoskeletal muscle analysis (muscle "
+                             "volume, intramuscular fat / composition) on T1 / T2 / Dixon / fat-fraction MRI or "
+                             "CT. Labels ~99 whole-body muscle & bone structures. Requires the SlicerMuscleMap "
+                             "extension + its dependencies (PyTorch + the MuscleMap package). HEAVY and BLOCKS "
+                             "Slicer's UI while it runs (it shells out to the mm_segment model). READ THE "
+                             "musclemap SKILL FIRST and confirm modality + warn about the wait. Use this over "
+                             "TotalSegmentator/MONAI when the user specifically wants MUSCLE quantification."),
+             "input_schema": {"type": "object", "properties": {
+                 "volume_name": {"type": "string", "description": "volume to segment; omit if only one is loaded"},
+                 "force_cpu": {"type": "boolean", "description": "force CPU even if a GPU is present"},
+                 "lower_overlap": {"type": "boolean", "description": "use lower sliding-window overlap (75% vs 90%) — less VRAM/faster, slightly coarser; try this on CUDA out-of-memory"}}}},
+
             {"name": "place_point",
              "description": "Place a labeled fiducial point at an RAS coordinate (mm).",
              "input_schema": {"type": "object", "properties": {
@@ -682,6 +730,28 @@ class ToolRegistry:
                              "Call this when the user asks what you can do or which skills you have, so "
                              "you report the REAL list — never invent skills or inflate the count."),
              "input_schema": {"type": "object", "properties": {}}},
+
+            {"name": "start_segmentation_recording",
+             "description": "Start recording user segmentation actions (paint, erase, clicks, brush sizes) in 3D Slicer.",
+             "input_schema": {"type": "object", "properties": {
+                 "output_filename": {"type": "string", "description": "JSON filename to save actions (default: slicer_cleanup_log.json)"}}}},
+
+            {"name": "stop_segmentation_recording",
+             "description": "Stop recording user segmentation actions and save the recorded log to disk.",
+             "input_schema": {"type": "object", "properties": {}}},
+
+            {"name": "get_segmentation_recording_status",
+             "description": "Get current status of the segmentation action recording.",
+             "input_schema": {"type": "object", "properties": {}}},
+
+            {"name": "mimic_segmentation_cleanup",
+             "description": "Replay recorded segmentation edits on a new target volume, using optional image registration to map coordinate systems.",
+             "input_schema": {"type": "object", "properties": {
+                 "trajectory_path": {"type": "string", "description": "Path to the recorded JSON trajectory file"},
+                 "target_segmentation": {"type": "string", "description": "Segmentation node name to clean up"},
+                 "source_volume": {"type": "string", "description": "Source reference volume name (used during recording)"},
+                 "target_volume": {"type": "string", "description": "Target reference volume name (the new patient)"}},
+              "required": ["trajectory_path", "target_segmentation"]}},
 
             {"name": "execute_python",
              "description": "Run Python code inside Slicer (slicer, vtk, qt, numpy available). THE USER MUST APPROVE each execution via a dialog. Use only for a genuinely novel read-only query when no dedicated tool exists. Do NOT use it to work around a missing capability or to edit segments/volumes by guessing at the API — if a segmentation/editing task has no dedicated tool, tell the user plainly instead. Set a variable named `result` for a value you want returned.",
@@ -781,7 +851,86 @@ class ToolRegistry:
         if node is None:
             return _err(f"Slicer could not load {path}")
         self._reset_views()
-        return _ok(f'Loaded "{node.GetName()}" ({node.GetClassName()}).')
+        hint = ""
+        # a mask/label file loaded as a plain volume can't be toggled/measured per-structure —
+        # steer to load_segmentation so the user actually SEES it as colored structures.
+        if node.IsA("vtkMRMLLabelMapVolumeNode"):
+            hint = (" This looks like a label map — call load_segmentation to turn it into a "
+                    "visible, per-structure segmentation you can list/measure/render.")
+        return _ok(f'Loaded "{node.GetName()}" ({node.GetClassName()}).' + hint)
+
+    def _tool_load_segmentation(self, path="", labelmap_name="", reference_volume=""):
+        """Load a mask / label file (or convert an already-loaded label volume) into a
+        vtkMRMLSegmentationNode and DISPLAY it, so the user sees colored structures and can
+        list / toggle / measure / 3D-render them. Closes the gap where load_file drops a mask
+        in as an inert labelmap the segmentation tools can't touch."""
+        labelmap = None
+        seg_direct = None
+        created_labelmap = False
+
+        if path:
+            path = os.path.expanduser(path)
+            if not os.path.exists(path):
+                return _err(f"file not found: {path}")
+            try:
+                if path.lower().endswith(".seg.nrrd"):
+                    seg_direct = slicer.util.loadSegmentation(path)   # native segmentation file
+                else:
+                    labelmap = slicer.util.loadLabelVolume(path)      # a mask/label NIfTI/NRRD
+                    created_labelmap = True
+            except Exception as exc:
+                return _err(f"Slicer could not load {path} as a segmentation/label map: {exc}")
+        elif labelmap_name:
+            node, error = _find_node(labelmap_name,
+                                     ["vtkMRMLLabelMapVolumeNode", "vtkMRMLScalarVolumeNode"])
+            if error:
+                return _err(error)
+            if node.IsA("vtkMRMLLabelMapVolumeNode"):
+                labelmap = node
+            else:
+                labelmap = _scalar_to_labelmap(node)                  # scalar mask -> labelmap
+                created_labelmap = True
+        else:
+            return _err("pass a file 'path' (a mask/label NIfTI/NRRD, or a .seg.nrrd), or the "
+                        "'labelmap_name' of a label volume already loaded, to turn into a segmentation.")
+
+        if seg_direct is not None:
+            seg_node = seg_direct
+        else:
+            seg_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLSegmentationNode",
+                slicer.mrmlScene.GenerateUniqueName(labelmap.GetName().replace("_label", "") + "_seg"))
+            seg_node.CreateDefaultDisplayNodes()
+            if reference_volume:
+                ref, _ref_err = _find_volume(reference_volume)
+                if ref is not None:
+                    seg_node.SetReferenceImageGeometryParameterFromVolumeNode(ref)
+            ok = slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                labelmap, seg_node)
+            if not ok:
+                return _err("failed to import the label map into a segmentation node — is it really a "
+                            "mask (integer labels), not a grayscale image?")
+            if created_labelmap:
+                slicer.mrmlScene.RemoveNode(labelmap)   # drop the raw labelmap; keep only the segmentation
+
+        # make it visible so the user actually sees the structures on the slices
+        disp = seg_node.GetDisplayNode()
+        if disp is not None:
+            disp.SetVisibility(True)
+            try:
+                disp.SetVisibility2DFill(True)
+                disp.SetVisibility2DOutline(True)
+            except Exception:
+                pass
+        self._reset_views()
+        count = seg_node.GetSegmentation().GetNumberOfSegments()
+        if count == 0:
+            return _err(f'"{seg_node.GetName()}" loaded but has 0 segments — the file may be an empty or '
+                        "non-integer mask.")
+        return _ok(f'Loaded "{seg_node.GetName()}" as a segmentation with {count} structure(s), now '
+                   "visible on the slice views. Use list_segments to see them, set_segment_visibility to "
+                   "toggle, measure_segment_volumes / measure_segment_statistics to measure, and "
+                   "show_segmentation_3d to render in 3D.")
 
     def _tool_import_dicom_folder(self, path):
         path = os.path.expanduser(path)
@@ -1919,6 +2068,110 @@ class ToolRegistry:
                    "them, measure_segment_volumes for volumes, then show_segmentation_3d to render "
                    "(heavy for 100+ organs — consider roi_subset or hiding most first).")
 
+    def _tool_run_musclemap(self, volume_name="", force_cpu=False, lower_overlap=False):
+        """SlicerMuscleMap whole-body muscle + bone segmentation (MuscleMap consortium).
+        Wraps WholeBodyMuscleSegmentationLogic.runSegmentation, which shells out to the
+        `mm_segment` CLI and imports the result back as a labelled segmentation node."""
+        volume, error = _find_volume(volume_name)
+        if error:
+            return _err(error)
+
+        # 1) is the extension actually loaded in THIS Slicer? (extensions are per-version)
+        st = _extension_status("WholeBodyMuscleSegmentation", "scripts")
+        where = "Slicer %s (rev %s)" % (st["version"], st["revision"])
+        if not st["module_loaded"]:
+            if st["on_disk_here"]:
+                return _err(
+                    "MuscleMap's files are present in %s but the WholeBodyMuscleSegmentation module "
+                    "didn't load — restart THIS Slicer once. If it still won't load, open View > "
+                    "Error Log (the extension likely failed to import, commonly a PyTorch/Qt "
+                    "mismatch)." % where)
+            return _err(
+                "the SlicerMuscleMap extension isn't loaded in the Slicer you're running now (%s). "
+                "Extensions are per-version and don't carry across installs: open Extensions Manager "
+                "> Manage Extensions, install 'SlicerMuscleMap', restart THIS Slicer, then retry." % where)
+
+        # 2) are its dependencies installed? MuscleMap needs PyTorch (SlicerPyTorch) + the MuscleMap
+        #    python package (the `mm_segment` CLI). Do NOT pip-install here — the module's own
+        #    'Install MuscleMap dependencies' button pins numpy/torch so it can't break Slicer.
+        import importlib.util
+        import shutil
+        torch_ok = importlib.util.find_spec("torch") is not None
+        try:
+            mm_ok = (shutil.which("mm_segment") is not None
+                     or importlib.util.find_spec("scripts.mm_segment") is not None)
+        except Exception:
+            mm_ok = shutil.which("mm_segment") is not None
+        if not (torch_ok and mm_ok):
+            missing = []
+            if not torch_ok:
+                missing.append("PyTorch (Slicer's 'PyTorch Util' module → Install PyTorch)")
+            if not mm_ok:
+                missing.append("the MuscleMap package (the `mm_segment` CLI)")
+            return _err(
+                "MuscleMap's dependencies aren't installed yet: %s. Install them ONCE without breaking "
+                "Slicer's Python — open Modules > Segmentation > MuscleMap (WholeBodyMuscleSegmentation) "
+                "and click 'Install MuscleMap dependencies' (it pins numpy/torch and pip-installs the "
+                "rest; a few minutes, one-time). Then retry. Do NOT pip-install it by hand." % ", ".join(missing))
+
+        try:
+            from WholeBodyMuscleSegmentation import WholeBodyMuscleSegmentationLogic
+        except ImportError as exc:
+            return _err(f"MuscleMap module import failed: {exc}")
+
+        # 3) device + expectation. runSegmentation calls the mm_segment subprocess and blocks the
+        #    calling thread, so the UI freezes for the run — seconds-to-minutes on GPU, longer on CPU.
+        gpu = False
+        try:
+            import torch
+            gpu = bool(torch.cuda.is_available())
+        except Exception:
+            gpu = False
+        device = "CPU" if (force_cpu or not gpu) else "GPU"
+
+        before_ids = {n.GetID() for n in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")}
+        logic = WholeBodyMuscleSegmentationLogic()
+        try:
+            from . import logbook
+            logbook.tool_call("run_musclemap[preflight]",
+                              {"volume": volume.GetName(), "device": device,
+                               "lower_overlap": bool(lower_overlap)})
+        except Exception:
+            pass
+        self._pump()   # paint the "running" state before the blocking job
+        # runSegmentation(inputVolumeNode, force_cpu=False, force_lower_overlap=False) -> segmentationNode.
+        # It calls ensureDependencies() itself (pip-installs monai/nibabel/... on first run, pins
+        # numpy/torch), saves the volume, runs the mm_segment subprocess (BLOCKS the UI), imports the
+        # labelmap into a "MuscleMapSegmentation" node, makes it visible, and returns that node.
+        seg_node = None
+        try:
+            seg_node = logic.runSegmentation(volume, force_cpu=bool(force_cpu),
+                                             force_lower_overlap=bool(lower_overlap))
+        except TypeError:
+            seg_node = logic.runSegmentation(volume, bool(force_cpu), bool(lower_overlap))
+        except Exception as exc:
+            return _err(
+                f"MuscleMap segmentation failed: {exc}. If it mentions mm_segment or torch, run the "
+                "module's 'Install MuscleMap dependencies' once. If it's CUDA out-of-memory, retry with "
+                "lower_overlap=true (uses less VRAM) or force_cpu=true.")
+        self._pump()
+
+        if seg_node is None:   # older builds returned nothing — fall back to the newly-added node
+            new = [n for n in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+                   if n.GetID() not in before_ids]
+            seg_node = new[-1] if new else None
+        if seg_node is None:
+            return _err(
+                "MuscleMap finished but no new segmentation appeared — the mm_segment subprocess likely "
+                "failed. Check View > Error Log / the module's log for the mm_segment output.")
+        count = seg_node.GetSegmentation().GetNumberOfSegments()
+        return _ok(
+            f'MuscleMap whole-body muscle segmentation finished ({device}): "{seg_node.GetName()}" has '
+            f'{count} muscle/bone structures. Use list_segments to see them, measure_segment_volumes for '
+            "muscle volumes, and measure_segment_statistics for mean intensity / intramuscular fat per "
+            "muscle; show_segmentation_3d to render (hide most first — many structures). Report the "
+            "muscle volume / fat-fraction measurements; do not diagnose.")
+
     def _tool_place_point(self, r, a, s, label=""):
         node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode",
                                                   label or "RadAssistant point")
@@ -2411,3 +2664,255 @@ class ToolRegistry:
             slicer.mrmlScene.Clear()
         return _ok(f"Cleared the scene — removed {before} data node(s); it is now empty. "
                    "Load new data with load_sample_data, load_file, or import_dicom_folder.")
+
+    def _on_slice_click(self, caller, event, slice_name):
+        if not self._recorder_active:
+            return
+        try:
+            import time
+            segmentEditorNode = slicer.mrmlScene.GetSingletonNode("SegmentEditor", "vtkMRMLSegmentEditorNode")
+            if not segmentEditorNode:
+                segmentEditorNode = slicer.mrmlScene.GetNodeByID("vtkMRMLSegmentEditorNode.Singleton")
+            
+            tool = "Paint"
+            radius = 3.0
+            if segmentEditorNode:
+                tool = segmentEditorNode.GetActiveEffectName() or "Paint"
+                r_val = segmentEditorNode.GetCommonParameter("PaintEffect.BrushRadius")
+                if r_val:
+                    radius = float(r_val)
+
+            layoutManager = slicer.app.layoutManager()
+            sliceWidget = layoutManager.sliceWidget(slice_name)
+            sliceLogic = sliceWidget.sliceLogic()
+            interactor = sliceWidget.sliceView().interactorStyle().GetInteractor()
+            eventPos = interactor.GetEventPosition()
+            
+            xyToRas = sliceLogic.GetSliceNode().GetXYToRAS()
+            displayPos = [eventPos[0], eventPos[1], 0, 1]
+            rasPos = [0, 0, 0, 1]
+            xyToRas.MultiplyPoint(displayPos, rasPos)
+            
+            # Extract local voxel intensity at click coordinate
+            intensity = None
+            vol_node = _active_volume()
+            if vol_node and vol_node.GetImageData():
+                rasToIjk = vtk.vtkMatrix4x4()
+                vol_node.GetRASToIJKMatrix(rasToIjk)
+                ijk = [0, 0, 0, 1]
+                rasToIjk.MultiplyPoint(rasPos, ijk)
+                i, j, k = int(round(ijk[0])), int(round(ijk[1])), int(round(ijk[2]))
+                img_data = vol_node.GetImageData()
+                dims = img_data.GetDimensions()
+                if 0 <= i < dims[0] and 0 <= j < dims[1] and 0 <= k < dims[2]:
+                    intensity = float(img_data.GetScalarComponentAsDouble(i, j, k, 0))
+            
+            event_entry = {
+                "timestamp": time.time(),
+                "event_type": "SLICE_CLICK",
+                "slice_view": slice_name,
+                "ras_coordinates": [round(rasPos[0], 2), round(rasPos[1], 2), round(rasPos[2], 2)],
+                "active_tool": tool,
+                "brush_radius_mm": radius,
+                "voxel_intensity": intensity
+            }
+            self._recorded_trajectory.append(event_entry)
+            print(f"[RadAssistant Recorder] Recorded action: {tool} at {event_entry['ras_coordinates']} mm (Intensity: {intensity})")
+        except Exception as exc:
+            print(f"[RadAssistant Recorder] Error recording event: {exc}")
+
+    def _tool_start_segmentation_recording(self, output_filename="slicer_cleanup_log.json"):
+        import time
+        self._recorded_trajectory = []
+        self._recorder_active = True
+        self._recorder_output_filename = output_filename
+        self._recorder_observers = []
+        
+        try:
+            layoutManager = slicer.app.layoutManager()
+            if layoutManager:
+                for sliceName in ["Red", "Green", "Yellow"]:
+                    sliceWidget = layoutManager.sliceWidget(sliceName)
+                    if sliceWidget:
+                        interactor = sliceWidget.sliceView().interactorStyle()
+                        tag = interactor.AddObserver(
+                            vtk.vtkCommand.LeftButtonPressEvent,
+                            lambda obj, evt, name=sliceName: self._on_slice_click(obj, evt, name)
+                        )
+                        self._recorder_observers.append((interactor, tag))
+        except Exception as exc:
+            return _err(f"failed to attach Slicer slice interactor observers: {exc}")
+
+        return _ok(f"Started recording segmentation actions. Actions will be logged to {output_filename}.")
+
+    def _tool_stop_segmentation_recording(self):
+        import json
+        self._recorder_active = False
+        
+        # Remove observers
+        count = 0
+        for subject, tag in self._recorder_observers:
+            try:
+                subject.RemoveObserver(tag)
+                count += 1
+            except Exception:
+                pass
+        self._recorder_observers = []
+        
+        # Save log file
+        try:
+            out_path = self._recorder_output_filename
+            with open(out_path, "w") as f:
+                json.dump(self._recorded_trajectory, f, indent=2)
+        except Exception as exc:
+            return _err(f"failed to save trajectory log to {out_path}: {exc}")
+            
+        n_events = len(self._recorded_trajectory)
+        return _ok(f"Stopped recording. Removed {count} listeners. Saved {n_events} action(s) to {out_path}.")
+
+    def _tool_get_segmentation_recording_status(self):
+        status = "Active" if self._recorder_active else "Inactive"
+        n_events = len(self._recorded_trajectory)
+        return _ok(f"Recording status: {status}. Captured {n_events} action(s) in current session. Saving to: {self._recorder_output_filename}")
+
+    def _tool_mimic_segmentation_cleanup(self, trajectory_path, target_segmentation, source_volume="", target_volume=""):
+        import json
+        import os
+        if not os.path.exists(trajectory_path):
+            return _err(f"trajectory file not found: {trajectory_path}")
+            
+        try:
+            with open(trajectory_path, "r") as f:
+                trajectory = json.load(f)
+        except Exception as exc:
+            return _err(f"failed to read trajectory JSON: {exc}")
+            
+        seg_node, error = _find_segmentation(target_segmentation)
+        if error:
+            return _err(f"target segmentation lookup: {error}")
+            
+        transform_node = None
+        if source_volume and target_volume:
+            src_vol, err1 = _find_volume(source_volume)
+            tgt_vol, err2 = _find_volume(target_volume)
+            if err1 or err2:
+                return _err(f"volume registration lookup: {err1 or err2}")
+            
+            # Register target_volume (moving) onto source_volume (fixed)
+            transform_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLLinearTransformNode",
+                slicer.mrmlScene.GenerateUniqueName("mimic_reg_transform")
+            )
+            resampled_volume = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLScalarVolumeNode",
+                slicer.mrmlScene.GenerateUniqueName("mimic_resampled")
+            )
+            
+            self._pump()
+            ok, status = self._run_cli(slicer.modules.brainsfit, {
+                "fixedVolume": src_vol.GetID(),
+                "movingVolume": tgt_vol.GetID(),
+                "outputVolume": resampled_volume.GetID(),
+                "linearTransform": transform_node.GetID(),
+                "transformType": "Rigid",
+                "initializeTransformMode": "useMomentsAlign",
+                "samplingPercentage": 0.02,
+            })
+            
+            slicer.mrmlScene.RemoveNode(resampled_volume)
+            
+            if not ok:
+                slicer.mrmlScene.RemoveNode(transform_node)
+                return _err(f"registration alignment failed: {status}")
+                
+            matrix = vtk.vtkMatrix4x4()
+            transform_node.GetMatrixTransformToParent(matrix)
+            inv_matrix = vtk.vtkMatrix4x4()
+            vtk.vtkMatrix4x4.Invert(matrix, inv_matrix)
+            
+        # Set up segment editor widget programmatically
+        editor_widget = slicer.qMRMLSegmentEditorWidget()
+        editor_widget.setMRMLScene(slicer.mrmlScene)
+        editor_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+        editor_widget.setMRMLSegmentEditorNode(editor_node)
+        editor_widget.setSegmentationNode(seg_node)
+        
+        ref_vol = _active_volume()
+        if ref_vol is None:
+            vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            ref_vol = vols[0] if vols else None
+        if ref_vol:
+            try:
+                editor_widget.setSourceVolumeNode(ref_vol)
+            except AttributeError:
+                editor_widget.setMasterVolumeNode(ref_vol)
+                
+        if seg_node.GetSegmentation().GetNumberOfSegments() > 0:
+            seg_id = seg_node.GetSegmentation().GetNthSegmentID(0)
+            editor_node.SetSelectedSegmentID(seg_id)
+        else:
+            slicer.mrmlScene.RemoveNode(editor_node)
+            if transform_node:
+                slicer.mrmlScene.RemoveNode(transform_node)
+            return _err("target segmentation has no segments")
+            
+        count = 0
+        skips = 0
+        errors = 0
+        for action in trajectory:
+            if action.get("event_type") == "SLICE_CLICK":
+                ras = action.get("ras_coordinates")
+                tool = action.get("active_tool", "Paint")
+                radius = action.get("brush_radius_mm", 3.0)
+                rec_intensity = action.get("voxel_intensity")
+                
+                # Transform coordinates if registration matrix is active
+                if transform_node:
+                    p_in = [ras[0], ras[1], ras[2], 1.0]
+                    p_out = [0, 0, 0, 1.0]
+                    inv_matrix.MultiplyPoint(p_in, p_out)
+                    ras = [p_out[0], p_out[1], p_out[2]]
+                    
+                # Safety Check: Sample target volume intensity at target coordinate
+                intensity_check_passed = True
+                if rec_intensity is not None and ref_vol and ref_vol.GetImageData():
+                    rasToIjk = vtk.vtkMatrix4x4()
+                    ref_vol.GetRASToIJKMatrix(rasToIjk)
+                    ijk = [0, 0, 0, 1]
+                    rasToIjk.MultiplyPoint([ras[0], ras[1], ras[2], 1.0], ijk)
+                    i, j, k = int(round(ijk[0])), int(round(ijk[1])), int(round(ijk[2]))
+                    img_data = ref_vol.GetImageData()
+                    dims = img_data.GetDimensions()
+                    if 0 <= i < dims[0] and 0 <= j < dims[1] and 0 <= k < dims[2]:
+                        tgt_intensity = float(img_data.GetScalarComponentAsDouble(i, j, k, 0))
+                        # If target intensity differs by more than 200 units (e.g. bone vs air/soft-tissue), safety skip
+                        if abs(tgt_intensity - rec_intensity) > 200.0:
+                            intensity_check_passed = False
+                            skips += 1
+                            print(f"[RadAssistant Mimic] Safety skip at {ras}: intensity mismatch (recorded: {rec_intensity}, target: {tgt_intensity})")
+                
+                if intensity_check_passed:
+                    editor_widget.setActiveEffectByName("Paint")
+                    effect = editor_widget.activeEffect()
+                    if effect:
+                        try:
+                            effect.setParameter("PaintEffect.BrushRadius", str(radius))
+                            if tool == "Erase":
+                                effect.setParameter("PaintEffect.Erase", "1")
+                            else:
+                                effect.setParameter("PaintEffect.Erase", "0")
+                            effect.self().paintAddPoint(ras)
+                            count += 1
+                        except Exception as e:
+                            errors += 1
+                self._pump()
+                
+        editor_widget.setActiveEffectByName("")
+        slicer.mrmlScene.RemoveNode(editor_node)
+        if transform_node:
+            slicer.mrmlScene.RemoveNode(transform_node)
+            
+        skip_msg = f" ({skips} stroke(s) safely skipped due to tissue intensity mismatch)" if skips > 0 else ""
+        err_msg = f" ({errors} error(s) during execution)" if errors > 0 else ""
+        return _ok(f"Successfully replayed {count} manual cleanup stroke(s) onto segmentation '{seg_node.GetName()}'{skip_msg}{err_msg}.")
+

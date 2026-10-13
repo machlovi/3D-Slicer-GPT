@@ -299,14 +299,31 @@ def _current_todos(built, run_config):
 
 def run_turn(built, text, run_config, emit, ask, should_stop=None, interrupts_possible=False):
     from langgraph.types import Command
+    from langchain_core.messages import AIMessage
     streamed = {}
     try:
-        stream = built.agent.stream(
-            {"messages": [{"role": "user", "content": text}]},
-            config=run_config, stream_mode="messages")
-        stopped = _consume_stream(stream, emit, streamed, should_stop)
-        # Only probe for interrupts if this mode can actually interrupt —
-        # otherwise skip the expensive get_state() [1][13].
+        try:
+            stream = built.agent.stream(
+                {"messages": [{"role": "user", "content": text}]},
+                config=run_config, stream_mode="messages")
+            stopped = _consume_stream(stream, emit, streamed, should_stop)
+        except Exception as exc:
+            err_str = str(exc)
+            if "No generations found in stream" in err_str or "stream" in err_str.lower():
+                result = built.agent.invoke(
+                    {"messages": [{"role": "user", "content": text}]},
+                    config=run_config
+                )
+                stopped = False
+                for msg in reversed(result.get("messages", [])):
+                    if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+                        content = msg.content if isinstance(msg.content, str) else ""
+                        if content:
+                            emit({"type": "assistant_delta", "id": getattr(msg, "id", "final"), "text": content})
+                        break
+            else:
+                raise exc
+
         while not stopped and interrupts_possible:
             request = _pending_interrupt(built, run_config)
             if request is None:
@@ -316,13 +333,34 @@ def run_turn(built, text, run_config, emit, ask, should_stop=None, interrupts_po
                               "description": a.get("description", "")} for a in actions])
             if decisions is None:
                 decisions = [{"type": "reject", "message": "Cancelled."} for _ in actions]
-            stream = built.agent.stream(Command(resume={"decisions": decisions}),
-                                        config=run_config, stream_mode="messages")
-            stopped = _consume_stream(stream, emit, streamed, should_stop)
+            try:
+                stream = built.agent.stream(Command(resume={"decisions": decisions}),
+                                            config=run_config, stream_mode="messages")
+                stopped = _consume_stream(stream, emit, streamed, should_stop)
+            except Exception as exc:
+                err_str = str(exc)
+                if "No generations found in stream" in err_str or "stream" in err_str.lower():
+                    result = built.agent.invoke(Command(resume={"decisions": decisions}), config=run_config)
+                    stopped = False
+                    for msg in reversed(result.get("messages", [])):
+                        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+                            content = msg.content if isinstance(msg.content, str) else ""
+                            if content:
+                                emit({"type": "assistant_delta", "id": getattr(msg, "id", "final"), "text": content})
+                            break
+                else:
+                    raise exc
+
         if stopped:
             emit({"type": "stopped"})
     except Exception as exc:
-        emit({"type": "error", "text": "Turn failed: %s" % exc})
+        err_str = str(exc)
+        if "model_dump" in err_str or "NoneType" in err_str and "model_dump" in err_str:
+            emit({"type": "error", "text": "Turn failed: The NYU GPT proxy returned an empty (null) response body. "
+                                          "As noted in your config, NYU GPT does not support tool calling loops. "
+                                          "Please use Ollama (local) or OpenAI Cloud for tool operations."})
+        else:
+            emit({"type": "error", "text": "Turn failed: %s" % exc})
     emit({"type": "turn_done"})
     
 

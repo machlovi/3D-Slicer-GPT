@@ -284,6 +284,26 @@ def build_slicer_tools(session: SlicerSession, *, vision: bool = False) -> list[
         tool provides."""
         return _text(session.exec_python(code))
 
+    @tool
+    def start_segmentation_recording(output_filename: str = "slicer_cleanup_log.json") -> str:
+        """Start recording user segmentation actions (paint, erase, clicks, brush sizes) in 3D Slicer."""
+        return _text(session.start_segmentation_recording(output_filename))
+
+    @tool
+    def stop_segmentation_recording() -> str:
+        """Stop recording user segmentation actions and save the recorded log to disk."""
+        return _text(session.stop_segmentation_recording())
+
+    @tool
+    def get_segmentation_recording_status() -> str:
+        """Get current status of the segmentation action recording."""
+        return _text(session.get_segmentation_recording_status())
+
+    @tool
+    def mimic_segmentation_cleanup(trajectory_path: str, target_segmentation: str, source_volume: str = "", target_volume: str = "") -> str:
+        """Replay recorded segmentation edits on a new target volume, using optional image registration to map coordinate systems."""
+        return _text(session.mimic_segmentation_cleanup(trajectory_path, target_segmentation, source_volume, target_volume))
+
     return [
         get_scene_overview,
         load_sample_data,
@@ -315,6 +335,10 @@ def build_slicer_tools(session: SlicerSession, *, vision: bool = False) -> list[
         merge_segments,
         delete_segments,
         execute_python,
+        start_segmentation_recording,
+        stop_segmentation_recording,
+        get_segmentation_recording_status,
+        mimic_segmentation_cleanup,
     ]
 
 
@@ -338,4 +362,8 @@ SEGMENTATION_TOOL_NAMES = (
     "segment_statistics",
     "run_total_segmentator",
     "set_window_level",
+    "start_segmentation_recording",
+    "stop_segmentation_recording",
+    "get_segmentation_recording_status",
+    "mimic_segmentation_cleanup",
 )

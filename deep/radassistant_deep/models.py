@@ -22,14 +22,14 @@ from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 
-PROVIDERS = ("ollama", "openai", "anthropic", "fake")
+PROVIDERS = ("ollama", "openai", "anthropic", "gemini", "fake")
 
-# Per-provider default model. The Anthropic default follows current Anthropic
-# guidance (Opus 4.8 unless the user asks for something else).
+# Per-provider default model.
 DEFAULTS = {
-    "ollama": "qwen3:14b",
-    "openai": "gpt-5.2",
-    "anthropic": "claude-opus-4-8",
+    "ollama": "qwen2.5:14b",
+    "openai": "gpt-4o",
+    "anthropic": "claude-3-7-sonnet-20250219",
+    "gemini": "gemini-2.0-flash",
 }
 
 ENV_MODEL = "RADASSISTANT_MODEL"
@@ -79,23 +79,74 @@ def create_model(spec: str | None = None, /, **kwargs: Any) -> BaseChatModel:
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        # OPENAI_BASE_URL / OPENAI_API_KEY env vars are honoured by the class
-        # itself, which is how RadAssistant points this at vLLM/llama.cpp
-        # OpenAI-compatible servers on the HPC. A base_url passed explicitly
-        # (the Server URL field) wins over the env var.
+        class SanitizedChatOpenAI(ChatOpenAI):
+            """ChatOpenAI wrapper that flattens list-based system message content blocks into a single string.
+
+            This ensures OpenAI-compatible proxies (such as NYU GPT, LiteLLM, vLLM) that do not support
+            Anthropic-style array system messages receive valid plain text system messages.
+            """
+
+            def _sanitize_messages(self, messages: list[Any]) -> None:
+                from langchain_core.messages import SystemMessage
+                for msg in messages:
+                    if isinstance(msg, SystemMessage) and isinstance(msg.content, list):
+                        text_blocks = []
+                        for b in msg.content:
+                            if isinstance(b, dict) and b.get("type") == "text":
+                                text_blocks.append(b.get("text", ""))
+                            elif isinstance(b, str):
+                                text_blocks.append(b)
+                        msg.content = "\n\n".join(text_blocks)
+
+            def _generate(self, messages: list[Any], stop: list[str] | None = None, run_manager: Any = None, **kwargs: Any) -> Any:
+                self._sanitize_messages(messages)
+                return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+            async def _agenerate(self, messages: list[Any], stop: list[str] | None = None, run_manager: Any = None, **kwargs: Any) -> Any:
+                self._sanitize_messages(messages)
+                return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+            def _stream(self, messages: list[Any], stop: list[str] | None = None, run_manager: Any = None, **kwargs: Any) -> Any:
+                self._sanitize_messages(messages)
+                return super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+            async def _astream(self, messages: list[Any], stop: list[str] | None = None, run_manager: Any = None, **kwargs: Any) -> Any:
+                self._sanitize_messages(messages)
+                return await super()._astream(messages, stop=stop, run_manager=run_manager, **kwargs)
+
         base_url = kwargs.pop("base_url", None) or os.environ.get("OPENAI_BASE_URL")
         if base_url:
+            base_url = base_url.rstrip("/")
+            if base_url.endswith("/chat/completions"):
+                base_url = base_url[:-len("/chat/completions")]
             kwargs["base_url"] = base_url
-        # Local HPC servers (llama.cpp/vLLM) usually ignore the key but the
-        # client still requires *some* value — supply a placeholder if none.
-        if not kwargs.get("api_key") and not os.environ.get("OPENAI_API_KEY"):
-            kwargs["api_key"] = "sk-no-auth"
-        return ChatOpenAI(model=model, **kwargs)
+        if not kwargs.get("api_key"):
+            env_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("UV_API_KEY")
+            if env_key:
+                kwargs["api_key"] = env_key
+            elif base_url and not ("api.openai.com" in base_url):
+                kwargs["api_key"] = "sk-no-auth"
+        kwargs.setdefault("stream_usage", False)
+        if kwargs.get("disable_streaming"):
+            kwargs["streaming"] = False
+            kwargs["disable_streaming"] = True
+        return SanitizedChatOpenAI(model=model, **kwargs)
 
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
+        if not kwargs.get("api_key") and os.environ.get("ANTHROPIC_API_KEY"):
+            kwargs["api_key"] = os.environ.get("ANTHROPIC_API_KEY")
         return ChatAnthropic(model=model, **kwargs)
+
+    if provider == "gemini":
+        from langchain_openai import ChatOpenAI
+
+        base_url = kwargs.pop("base_url", None) or "https://generativelanguage.googleapis.com/v1beta/openai/"
+        kwargs["base_url"] = base_url
+        if not kwargs.get("api_key"):
+            kwargs["api_key"] = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+        return SanitizedChatOpenAI(model=model, **kwargs)
 
     if provider == "fake":
         # Deterministic scripted model for tests and offline demos.

@@ -34,7 +34,12 @@ from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 
 from .memory import LearningStore, ensure_persona, PERSONA_FILENAME
-from .middleware import DiagnosisGuardMiddleware, PolicyMiddleware, SceneContextMiddleware
+from .middleware import (
+    DiagnosisGuardMiddleware,
+    OpenAIProxySanitizerMiddleware,
+    PolicyMiddleware,
+    SceneContextMiddleware,
+)
 from .models import create_model
 from .policy import ApprovalMode, interrupt_config_for_mode
 from .prompts import build_system_prompt
@@ -94,14 +99,12 @@ class AgentConfig:
     api_key: str | None = None               # optional; local servers usually ignore it
     approval_mode: ApprovalMode = "accept"
     vision: bool = False
+    disable_streaming: bool = False
     home: Path | None = None                 # persona + MEMORY.md live here
     skills_dir: Path | None = None           # SKILL.md library (RadAssistant's by default)
     live_url: str | None = None              # http://host:2016 -> real Slicer
     session: SlicerSession | None = None     # explicit injection (tests) wins
     checkpointer: BaseCheckpointSaver | None = None
-    # False removes the specialist roster (scene-explorer/segmentation-
-    # specialist/verifier); deepagents' built-in general-purpose subagent and
-    # the task tool remain — that is core harness behaviour.
     subagents_enabled: bool = True
     extra_tools: list[Any] = field(default_factory=list)
 
@@ -140,6 +143,8 @@ def build_agent(config: AgentConfig | None = None) -> BuiltAgent:
             model_kwargs["base_url"] = config.base_url
         if config.api_key:
             model_kwargs["api_key"] = config.api_key
+        if config.disable_streaming:
+            model_kwargs["disable_streaming"] = True
         model = create_model(config.model, **model_kwargs)
     session = _make_session(config)
 
@@ -176,6 +181,7 @@ def build_agent(config: AgentConfig | None = None) -> BuiltAgent:
         SceneContextMiddleware(session),
         policy,
         DiagnosisGuardMiddleware(),
+        OpenAIProxySanitizerMiddleware(),
     ]
 
     # --- subagents ---------------------------------------------------------------

@@ -84,7 +84,30 @@ class OpenAICompatBackend(Backend):
                 wire.append({"role": "user", "content":
                              [{"type": "text", "text": "(image output from the previous tool)"}]
                              + image_parts})
-        return wire
+
+        # Post-process wire list: merge consecutive messages with identical roles
+        # to satisfy strict local server Jinja chat templates (e.g. llama.cpp / vLLM).
+        merged = []
+        for msg in wire:
+            if (merged
+                    and merged[-1]["role"] == msg["role"]
+                    and "tool_calls" not in merged[-1]
+                    and "tool_calls" not in msg):
+                prev = merged[-1]
+                p_cnt = prev.get("content", "")
+                m_cnt = msg.get("content", "")
+                if isinstance(p_cnt, str) and isinstance(m_cnt, str):
+                    prev["content"] = (p_cnt + "\n\n" + m_cnt).strip()
+                elif isinstance(p_cnt, list) and isinstance(m_cnt, list):
+                    prev["content"] = p_cnt + m_cnt
+                elif isinstance(p_cnt, str) and isinstance(m_cnt, list):
+                    prev["content"] = [{"type": "text", "text": p_cnt}] + m_cnt
+                elif isinstance(p_cnt, list) and isinstance(m_cnt, str):
+                    prev["content"] = p_cnt + [{"type": "text", "text": m_cnt}]
+            else:
+                merged.append(msg)
+        return merged
+
 
     def run_turn(self, system, messages, tools, on_text=None, on_thinking=None):
         body = {
@@ -111,11 +134,18 @@ class OpenAICompatBackend(Backend):
             response = urllib.request.urlopen(request, timeout=self._timeout)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
+            if exc.code in (401, 403):
+                return TurnResult([], "error", error=(
+                    f"API key rejected or unauthorized (HTTP {exc.code}). "
+                    "Check your API key in Setup or verify environment variables."))
+            if exc.code == 429:
+                return TurnResult([], "error", error=(
+                    "Rate limit or quota exceeded (HTTP 429). "
+                    "Check your API account quota or wait before retrying."))
             if exc.code == 404:
                 return TurnResult([], "error", error=(
                     f"404 at {self._url}. The Server URL should be the API BASE ending in /v1 "
-                    "(e.g. http://localhost:8080/v1) — not the web-UI page. Verify with: "
-                    "curl http://localhost:8080/v1/models (should return JSON)."))
+                    "(e.g. https://api.openai.com/v1 or http://localhost:8080/v1)."))
             return TurnResult([], "error", error=f"Server HTTP {exc.code}: {detail}")
         except urllib.error.URLError as exc:
             return TurnResult([], "error",

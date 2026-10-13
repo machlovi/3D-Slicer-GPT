@@ -15,3 +15,10 @@ deep/slicer_module/RadAssistantDeep/__pycache__/RadAssistantDeep.cpython-312.pyc
 deep/tests/test_inprocess.py
 deep/slicer_module/RadAssistantDeep/__pycache__/RadAssistantDeep.cpython-312.pyc
 deep/slicer_module/RadAssistantDeep/__pycache__/RadAssistantDeep.cpython-312.pyc
+deep/.venv/*
+eval_results/
+deep/manual_test_output.txt
+deep/radassistant_deep.egg-info/
+**/__pycache__/*cpython-313*.pyc
+deep/tests/__pycache__/
+engine/tests/__pycache__/

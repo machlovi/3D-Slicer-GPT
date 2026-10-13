@@ -122,6 +122,10 @@ class SlicerSession(Protocol):
     def merge_segments(self, segment_names: list[str], new_name: str | None) -> ToolOutcome: ...
     def delete_segments(self, segment_names: list[str]) -> ToolOutcome: ...
     def exec_python(self, code: str) -> ToolOutcome: ...
+    def start_segmentation_recording(self, output_filename: str) -> ToolOutcome: ...
+    def stop_segmentation_recording(self) -> ToolOutcome: ...
+    def get_segmentation_recording_status(self) -> ToolOutcome: ...
+    def mimic_segmentation_cleanup(self, trajectory_path: str, target_segmentation: str, source_volume: str, target_volume: str) -> ToolOutcome: ...
 
 
 # Slicer extensions the deep agent knows how to require, keyed by the exact
@@ -502,3 +506,19 @@ class MockSlicerSession:
         if not removed:
             return err(f"No segments matched: {segment_names}.")
         return ok(f"Deleted {len(removed)} segment(s): {', '.join(removed)}. (mock)")
+
+    def start_segmentation_recording(self, output_filename: str) -> ToolOutcome:
+        self._record("start_segmentation_recording", output_filename=output_filename)
+        return ok(f"Started recording actions. (mock)")
+
+    def stop_segmentation_recording(self) -> ToolOutcome:
+        self._record("stop_segmentation_recording")
+        return ok("Stopped recording actions. (mock)")
+
+    def get_segmentation_recording_status(self) -> ToolOutcome:
+        self._record("get_segmentation_recording_status")
+        return ok("Recording status: Inactive. (mock)")
+
+    def mimic_segmentation_cleanup(self, trajectory_path: str, target_segmentation: str, source_volume: str = "", target_volume: str = "") -> ToolOutcome:
+        self._record("mimic_segmentation_cleanup", trajectory_path=trajectory_path, target_segmentation=target_segmentation, source_volume=source_volume, target_volume=target_volume)
+        return ok(f"Successfully replayed cleanup actions onto '{target_segmentation}'. (mock)")

@@ -58,11 +58,13 @@ def build_backend(config):
             num_ctx=config.get("num_ctx", 16384),
             vision=config.get("vision"),
         )
-    if provider == "openai":
+    if provider in ("openai", "openai_cloud", "openai_official"):
         from .openai_backend import OpenAICompatBackend
+        default_url = "https://api.openai.com/v1" if provider in ("openai_cloud", "openai_official") else "http://localhost:8000/v1"
+        default_model = "gpt-4o" if provider in ("openai_cloud", "openai_official") else ""
         return OpenAICompatBackend(
-            base_url=config.get("base_url", "http://localhost:8000/v1"),
-            model=config.get("model", ""),
+            base_url=config.get("base_url") or default_url,
+            model=config.get("model") or default_model,
             api_key=config.get("api_key") or None,
             vision=bool(config.get("vision")),
         )

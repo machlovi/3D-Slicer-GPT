@@ -1,6 +1,6 @@
 ---
 name: radiotherapy-dvh
-description: Compute radiotherapy dose-volume histograms (DVH) and dose metrics (V-metrics, D-metrics) for organs-at-risk and targets via compute_dvh. Use when the user has an RT dose volume + structure segmentation and asks about dose to a structure, DVH, coverage, or OAR dose. QUANTIFY dose only — never judge whether the plan is acceptable or safe; that is the radiation oncologist's call.
+description: Compute radiotherapy dose-volume histograms (DVH) and dose metrics (V-metrics / D-metrics) for organs-at-risk and targets via compute_dvh. Use for "compute the DVH", "how much dose is the cord/lung/parotid getting", "V20 of the lung", "D2cc of the cord", "D95 of the PTV", "mean dose to the heart", "target coverage", "OAR sparing/dose", "hot spot", "max dose to <organ>" — any RT dose-volume question over a loaded RTDOSE + structure set. QUANTIFY dose only — never judge whether the plan is acceptable or safe; that is the radiation oncologist's call.
 ---
 
 # Radiotherapy DVH & dose metrics

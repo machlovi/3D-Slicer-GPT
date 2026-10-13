@@ -152,18 +152,31 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
         self.layout.addWidget(setupBox)
         form = qt.QFormLayout(setupBox)
 
-        self.modelEdit = qt.QLineEdit(self.logic._get("model", "openai:qwen-vision"))
-        self.modelEdit.toolTip = "provider:model - e.g. openai:qwen-vision (local server), anthropic:claude-opus-4-8, ollama:qwen3:14b"
+        self.providerCombo = qt.QComboBox()
+        self.providerCombo.addItem("OpenAI Cloud (gpt-4o, etc.)", "openai_cloud")
+        self.providerCombo.addItem("Anthropic Claude (claude-3-7-sonnet)", "anthropic")
+        self.providerCombo.addItem("Gemini Cloud (gemini-2.0-flash)", "gemini")
+        self.providerCombo.addItem("Ollama (local / HPC)", "ollama")
+        self.providerCombo.addItem("OpenAI-compatible (vLLM / LM Studio)", "openai_local")
+        self.providerCombo.addItem("Custom model spec (provider:model)", "custom")
+        saved_provider = self.logic._get("provider", "openai_cloud")
+        idx = max(0, self.providerCombo.findData(saved_provider))
+        self.providerCombo.setCurrentIndex(idx)
+        self.providerCombo.connect("currentIndexChanged(int)", lambda _i: self._on_provider_changed())
+        form.addRow("Backend / Preset:", self.providerCombo)
+
+        self.modelEdit = qt.QLineEdit(self.logic._get("model", "openai:gpt-4o"))
+        self.modelEdit.toolTip = "provider:model - e.g. openai:gpt-4o, anthropic:claude-3-7-sonnet-20250219, gemini:gemini-2.0-flash, ollama:qwen2.5:14b"
         form.addRow("Model:", self.modelEdit)
 
         self.serverEdit = qt.QLineEdit(self.logic._get("serverUrl", ""))
-        self.serverEdit.placeholderText = "http://127.0.0.1:11441/v1  (blank for cloud/default)"
-        self.serverEdit.toolTip = "Model server address. For a local llama.cpp/vLLM server use http://127.0.0.1:<port>/v1."
+        self.serverEdit.placeholderText = "https://api.openai.com/v1 or http://127.0.0.1:8000/v1 (blank for cloud default)"
+        self.serverEdit.toolTip = "Model server address. Leave blank for official cloud endpoints or specify custom http://<host>:<port>/v1."
         form.addRow("Server URL:", self.serverEdit)
 
         self.apiKeyEdit = qt.QLineEdit(self.logic._get("apiKey", ""))
         self.apiKeyEdit.echoMode = qt.QLineEdit.Password
-        self.apiKeyEdit.placeholderText = "optional (local servers ignore it)"
+        self.apiKeyEdit.placeholderText = "sk-… (or set OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY env var)"
         form.addRow("API key:", self.apiKeyEdit)
 
         self.approvalCombo = qt.QComboBox()
@@ -181,6 +194,11 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
         self.thinkingCheck.checked = self.logic._get("showThinking", "true") == "true"
         self.thinkingCheck.toolTip = "Show the model's reasoning (thinking) live in the chat."
         form.addRow("Show thinking:", self.thinkingCheck)
+
+        self.disableStreamingCheck = qt.QCheckBox()
+        self.disableStreamingCheck.checked = self.logic._get("disableStreaming", "false") == "true"
+        self.disableStreamingCheck.toolTip = "Turn ON for proxies like NYU GPT / LiteLLM that do not support SSE streaming."
+        form.addRow("Disable streaming:", self.disableStreamingCheck)
 
         btnRow = qt.QHBoxLayout()
         self.connectButton = qt.QPushButton("Connect")
@@ -287,13 +305,46 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
         sb.setValue(sb.maximum)
 
     # -- connect ---------------------------------------------------------------
+    def _on_provider_changed(self):
+        provider = self.providerCombo.currentData
+        if provider == "ollama":
+            self.modelEdit.setText("ollama:qwen2.5:14b")
+            self.serverEdit.setText("http://localhost:11434")
+            self.apiKeyEdit.setPlaceholderText("optional (local servers ignore it)")
+            self.visionCheck.checked = False
+        elif provider == "openai_cloud":
+            self.modelEdit.setText("openai:gpt-4o")
+            self.serverEdit.setText("")
+            self.apiKeyEdit.setPlaceholderText("sk-proj-… (or set OPENAI_API_KEY env var)")
+            self.visionCheck.checked = True
+        elif provider == "gemini":
+            self.modelEdit.setText("gemini:gemini-2.0-flash")
+            self.serverEdit.setText("")
+            self.apiKeyEdit.setPlaceholderText("AIzaSy… (or set GEMINI_API_KEY env var)")
+            self.visionCheck.checked = True
+        elif provider == "anthropic":
+            self.modelEdit.setText("anthropic:claude-3-7-sonnet-20250219")
+            self.serverEdit.setText("")
+            self.apiKeyEdit.setPlaceholderText("sk-ant-… (or set ANTHROPIC_API_KEY env var)")
+            self.visionCheck.checked = True
+        elif provider == "openai_local":
+            self.modelEdit.setText("openai:qwen-vision")
+            self.serverEdit.setText("http://127.0.0.1:8000/v1")
+            self.apiKeyEdit.setPlaceholderText("optional for local servers")
+            self.visionCheck.checked = True
+        elif provider == "custom":
+            self.apiKeyEdit.setPlaceholderText("sk-… or env var fallback")
+        self._saveSettings()
+
     def _saveSettings(self):
+        self.logic._set("provider", self.providerCombo.currentData)
         self.logic._set("model", self.modelEdit.text)
         self.logic._set("serverUrl", self.serverEdit.text)
         self.logic._set("apiKey", self.apiKeyEdit.text)
         self.logic._set("approval", self.approvalCombo.currentText)
         self.logic._set("vision", "true" if self.visionCheck.checked else "false")
         self.logic._set("showThinking", "true" if self.thinkingCheck.checked else "false")
+        self.logic._set("disableStreaming", "true" if self.disableStreamingCheck.checked else "false")
 
     def _ensure_deps(self):
         try:
@@ -315,14 +366,26 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
                 return False
             return True
 
-    def _model_reachable(self, base_url):
-        """Quick reachability probe so Connect fails fast with a clear message
-        instead of hanging on the first turn when the model server isn't answering."""
+    def _model_reachable(self, base_url, api_key=None):
+        """Quick reachability probe so Connect fails fast with a clear message."""
         import urllib.request
-        url = base_url.rstrip("/") + "/models"
+        import urllib.error
+        base = base_url.rstrip("/")
+        if base.endswith("/chat/completions"):
+            base = base[:-len("/chat/completions")]
+        url = base + "/models"
         try:
-            urllib.request.urlopen(url, timeout=6).read(1)
+            req = urllib.request.Request(url)
+            if api_key:
+                req.add_header("Authorization", f"Bearer {api_key}")
+            urllib.request.urlopen(req, timeout=6).read(1)
             return True, ""
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return False, f"Server rejected API key (HTTP {exc.code})"
+            if exc.code in (404, 405):
+                return True, ""  # Gateway reached, but /models endpoint restricted
+            return False, f"HTTP {exc.code}"
         except Exception as exc:
             return False, str(exc)
 
@@ -330,20 +393,39 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
         self._saveSettings()
         model_spec = self.modelEdit.text.strip()
         server_url = self.serverEdit.text.strip()
-        if model_spec.startswith("openai:") and not server_url:
-            slicer.util.errorDisplay(
-                "Model '%s' uses the OpenAI-compatible API but the Server URL is blank, so it "
-                "would call the real OpenAI cloud and fail for a local model. Set the Server URL "
-                "to your local endpoint, e.g. http://127.0.0.1:11441/v1." % model_spec)
-            return
+        provider = self.providerCombo.currentData
+
+        # Resolve API key from UI or provider-specific environment variable
+        api_key = self.apiKeyEdit.text.strip()
+        if not api_key:
+            if provider == "anthropic" or model_spec.startswith("anthropic:"):
+                api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("UV_API_KEY", "")
+            elif provider == "gemini" or model_spec.startswith("gemini:"):
+                api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("UV_API_KEY", "")
+            elif provider in ("openai_cloud", "openai_local") or model_spec.startswith("openai:"):
+                api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("UV_API_KEY", "")
+
+        if (model_spec.startswith("openai:") or provider == "openai_cloud") and not server_url:
+            if api_key:
+                server_url = "https://api.openai.com/v1"
+            else:
+                slicer.util.errorDisplay(
+                    "Model '%s' uses OpenAI, but no Server URL or API key was provided.\n\n"
+                    "• For OpenAI Cloud: enter your API key (sk-...).\n"
+                    "• For local servers (vLLM / LM Studio / llama.cpp): enter your Server URL (e.g. http://127.0.0.1:8000/v1)." % model_spec)
+                return
+
         if server_url:
-            reachable, why = self._model_reachable(server_url)
+            base = server_url.rstrip("/")
+            if base.endswith("/chat/completions"):
+                server_url = base[:-len("/chat/completions")]
+                self.serverEdit.setText(server_url)
+
+            reachable, why = self._model_reachable(server_url, api_key=api_key)
             if not reachable:
                 slicer.util.errorDisplay(
                     "Can't reach the model server at %s\n(%s).\n\nThe server isn't answering. "
-                    "Check it's running AND on this exact port, then confirm by opening\n"
-                    "    %s/models\nin a browser - it should return JSON instantly. "
-                    "(Your last server came up on port 11440.)" % (server_url, why, server_url.rstrip("/")))
+                    "Check that it is running AND on this exact URL/port." % (server_url, why))
                 return
         if not self._ensure_deps():
             return
@@ -369,6 +451,7 @@ class RadAssistantDeepWidget(ScriptedLoadableModuleWidget):
                 api_key=self.apiKeyEdit.text.strip() or None,
                 approval_mode=self.approvalCombo.currentText,
                 vision=self.visionCheck.checked,
+                disable_streaming=self.disableStreamingCheck.checked,
                 skills_dir=_SKILLS,
                 subagents_enabled=False,
             )

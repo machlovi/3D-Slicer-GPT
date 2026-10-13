@@ -1,0 +1,5 @@
+# generated / Slicer scratch that must never live in the source folder
+__pycache__/
+*.pyc
+ctkDICOM*.sql
+*.sql

@@ -38,8 +38,8 @@ _DESTRUCTIVE_PATTERNS = (
 _PHI_EGRESS_EXACT = {"web_search", "web_fetch", "search_web", "fetch_url"}
 _PHI_EGRESS_PATTERNS = ("web_", "http_", "upload", "_egress", "cloud_")
 # Heavy compute — candidates for HPC offload (not a safety risk, an advisory tier).
-_HEAVY_EXACT = {"run_total_segmentator", "extract_radiomics"}
-_HEAVY_PATTERNS = ("nninteractive", "medgemma", "totalsegmentator", "radiomics")
+_HEAVY_EXACT = {"run_total_segmentator", "extract_radiomics", "run_musclemap"}
+_HEAVY_PATTERNS = ("nninteractive", "medgemma", "totalsegmentator", "radiomics", "musclemap")
 
 
 def _match(name, exact, patterns):
